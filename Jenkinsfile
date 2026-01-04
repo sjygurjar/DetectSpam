@@ -3,7 +3,7 @@ pipeline {
     stages {
       stage (" hello") {
         step {
-	  echo "hello from Jenkinsfile"
+          echo "hello from Jenkinsfile"
 	}
       }
     }
