@@ -1,82 +1,121 @@
-import pandas as pd
-import numpy as np
-import re
-from nltk.corpus import stopwords
-from nltk.stem.porter import PorterStemmer
-from sklearn.feature_extraction.text import CountVectorizer
-from sklearn.model_selection import train_test_split
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import classification_report, confusion_matrix
+import streamlit as st  # type: ignore
 import pickle
+import re
+import io
+import pandas as pd
+from nltk.corpus import stopwords  # type: ignore
+from nltk.stem.porter import PorterStemmer  # type: ignore
 import nltk
 
 nltk.download('stopwords', quiet=True)
 
-# Load the dataset
-data = pd.read_csv("spam.csv", encoding="ISO-8859-1")
-data = data[['v1', 'v2']]
-data.columns = ['label', 'message']
-data['label'] = data['label'].map({'ham': 0, 'spam': 1})
+# Load the trained model and vectorizer
+try:
+    model = pickle.load(open("spam_detector.pkl", "rb"))
+    vectorizer = pickle.load(open("vectorizer.pkl", "rb"))
+except FileNotFoundError:
+    st.error("Model or vectorizer file not found. Please ensure 'spam_detector.pkl' and 'vectorizer.pkl' are in the same directory.")
+    st.stop()
 
-# BUG FIX #5: guard against unmapped labels / missing messages instead of
-# silently feeding NaNs into training (defensive, even though current
-# spam.csv happens to be clean).
-data = data.dropna(subset=['label', 'message'])
-data['label'] = data['label'].astype(int)
-
-# BUG FIX #2: load stopwords ONCE as a set, not inside the per-word loop.
-# stopwords.words('english') rebuilds a ~179-word list from disk on every
-# call; doing that for every single word in every message made both
-# training and live classification far slower than necessary.
+# BUG FIX: load stopwords ONCE as a set instead of re-fetching the list
+# inside the per-word comprehension on every single classification.
 STOP_WORDS = set(stopwords.words('english'))
 ps = PorterStemmer()
 
 
 def preprocess_text(text):
-    """Clean and stem a message for the bag-of-words model.
+    """Clean and stem input text for the bag-of-words model.
 
-    BUG FIX #3: the old regex `[^a-zA-Z]` stripped every digit and symbol,
-    throwing away strong spam signals like prices ("$1000"), percentages
-    ("100% free"), and phone numbers. We now keep digits and the
-    currency/percent symbols that commonly appear in spam, only dropping
-    punctuation that adds noise.
+    BUG FIX: keep digits, $ and % instead of stripping every non-letter
+    character — prices, phone numbers and percentages are strong spam
+    signals that the original regex threw away entirely. Must match the
+    preprocessing used in train_model.py or the vectorizer's vocabulary
+    won't line up with the input.
     """
-    text = re.sub(r'[^a-zA-Z0-9$%]', ' ', text)
-    words = text.lower().split()
-    stemmed = [ps.stem(w) for w in words if w not in STOP_WORDS]
-    return ' '.join(stemmed)
+    review = re.sub(r'[^a-zA-Z0-9$%]', ' ', text)
+    review = review.lower().split()
+    review = [ps.stem(word) for word in review if word not in STOP_WORDS]
+    return ' '.join(review)
 
 
-corpus = [preprocess_text(msg) for msg in data['message']]
+def classify(text):
+    """Single source of truth for prediction, used by every input path
+    below so behavior can't drift between them (the old code duplicated
+    this logic three times, inconsistently)."""
+    processed_text = preprocess_text(text)
+    vectorized_input = vectorizer.transform([processed_text])
+    prediction = model.predict(vectorized_input)[0]
+    confidence = model.predict_proba(vectorized_input)[0][prediction]
+    return prediction, confidence
 
-# Vectorization
-cv = CountVectorizer(max_features=4000)
-X = cv.fit_transform(corpus).toarray()
-Y = data['label']
 
-# BUG FIX #6: stratify the split so the train/test sets keep the same
-# ~87/13 ham/spam ratio as the full dataset, instead of leaving it to chance.
-X_train, X_test, Y_train, Y_test = train_test_split(
-    X, Y, test_size=0.2, random_state=42, stratify=Y
-)
+def show_result(prediction, confidence):
+    label = "SPAM" if prediction == 1 else "HAM"
+    st.success(f"This email is **{label}** (confidence: {confidence:.0%}).")
 
-# BUG FIX #1 + #7: address class imbalance with class_weight='balanced' so
-# the model isn't biased toward predicting "ham", and set random_state so
-# the trained model is reproducible across runs.
-model = RandomForestClassifier(
-    n_estimators=300,
-    class_weight='balanced',
-    random_state=42,
-)
-model.fit(X_train, Y_train)
 
-# Quick sanity check on held-out data
-pred = model.predict(X_test)
-print(classification_report(Y_test, pred, target_names=['ham', 'spam']))
-print(confusion_matrix(Y_test, pred))
+# Streamlit App
+st.title("Email Spam Detection App")
+st.write("Upload an email or enter text to classify it as Spam or Ham!")
 
-# Save the model and vectorizer
-pickle.dump(model, open("spam_detector.pkl", "wb"))
-pickle.dump(cv, open("vectorizer.pkl", "wb"))
+# Input options
+input_method = st.radio("Choose input method:", ("Type text", "Upload file"))
 
-print("Model and vectorizer saved successfully!")
+if input_method == "Type text":
+    user_input = st.text_area("Enter email content here:")
+    if st.button("Classify"):
+        if user_input.strip():
+            prediction, confidence = classify(user_input)
+            show_result(prediction, confidence)
+        else:
+            st.error("Please enter some text to classify.")
+
+elif input_method == "Upload file":
+    uploaded_file = st.file_uploader(
+        "Upload a text/email file, or a CSV with a 'message' column",
+        type=["txt", "eml", "csv"],
+    )
+    if uploaded_file:
+        # BUG FIX: decode() with no error handling crashed on non-UTF-8
+        # files (.eml files are frequently Windows-1252, base64, or
+        # quoted-printable). Fall back gracefully instead of raising.
+        raw_bytes = uploaded_file.read()
+        try:
+            file_text = raw_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            file_text = raw_bytes.decode("utf-8", errors="replace")
+            st.warning("File wasn't valid UTF-8 — some characters were replaced while reading it.")
+
+        if uploaded_file.name.lower().endswith(".csv"):
+            # BUG FIX: the original code dumped the *entire raw CSV text*
+            # (headers, commas, every row) into the classifier as if it
+            # were one email. Now we actually parse it and classify each
+            # message in a 'message' (or first text-like) column.
+            try:
+                df = pd.read_csv(io.StringIO(file_text))
+            except Exception as e:
+                st.error(f"Couldn't parse this as a CSV: {e}")
+                df = None
+
+            if df is not None:
+                text_col = "message" if "message" in df.columns else df.columns[0]
+                st.write(f"Classifying {len(df)} rows from column '{text_col}':")
+                results = []
+                for msg in df[text_col].astype(str):
+                    prediction, confidence = classify(msg)
+                    results.append("SPAM" if prediction == 1 else "HAM")
+                df["prediction"] = results
+                st.dataframe(df[[text_col, "prediction"]])
+        else:
+            st.write("Uploaded Email Content:")
+            st.text(file_text)
+            if st.button("Classify"):
+                prediction, confidence = classify(file_text)
+                show_result(prediction, confidence)
+
+# Optional sample test
+sample_email = "Congratulations! You've won a $1000 gift card. Click here to claim."
+if st.checkbox("Run Sample Test"):
+    prediction, confidence = classify(sample_email)
+    label = "Spam" if prediction == 1 else "Not Spam"
+    st.write(f"The sample email is classified as: **{label}** (confidence: {confidence:.0%})")
