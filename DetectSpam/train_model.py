@@ -7,7 +7,7 @@ from sklearn.feature_extraction.text import CountVectorizer
 from sklearn.model_selection import train_test_split
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import classification_report, confusion_matrix
-import pickle
+import joblib
 import nltk
 
 nltk.download('stopwords', quiet=True)
@@ -75,8 +75,11 @@ pred = model.predict(X_test)
 print(classification_report(Y_test, pred, target_names=['ham', 'spam']))
 print(confusion_matrix(Y_test, pred))
 
-# Save the model and vectorizer
-pickle.dump(model, open("spam_detector.pkl", "wb"))
-pickle.dump(cv, open("vectorizer.pkl", "wb"))
+# BUG FIX #8: raw pickle produced a ~26MB file (over GitHub's 25MB web
+# upload limit). joblib is what scikit-learn itself recommends for
+# persisting sklearn models, and compression shrinks this to ~7MB with
+# no change to the model itself — just how it's stored on disk.
+joblib.dump(model, "spam_detector.pkl", compress=3)
+joblib.dump(cv, "vectorizer.pkl", compress=3)
 
 print("Model and vectorizer saved successfully!")
