@@ -1,5 +1,5 @@
 import streamlit as st  # type: ignore
-import pickle
+import joblib
 import re
 import io
 import pandas as pd
@@ -11,8 +11,8 @@ nltk.download('stopwords', quiet=True)
 
 # Load the trained model and vectorizer
 try:
-    model = pickle.load(open("spam_detector.pkl", "rb"))
-    vectorizer = pickle.load(open("vectorizer.pkl", "rb"))
+    model = joblib.load("spam_detector.pkl")
+    vectorizer = joblib.load("vectorizer.pkl")
 except FileNotFoundError:
     st.error("Model or vectorizer file not found. Please ensure 'spam_detector.pkl' and 'vectorizer.pkl' are in the same directory.")
     st.stop()
